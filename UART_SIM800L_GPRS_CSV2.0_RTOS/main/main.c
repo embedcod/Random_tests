@@ -1,0 +1,215 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "string.h"
+
+// Pins definition
+#define RX_PIN (GPIO_NUM_16)  // ESP32 Rx pin (connected to GSM Tx)
+#define TX_PIN (GPIO_NUM_17)  // ESP32 Tx pin (connected to GSM Rx)
+#define RESET_PIN (GPIO_NUM_14)  // GSM reset pin connected to IO14 on ESP32
+
+static const int RX_BUF_SIZE = 1024;
+static const char *TAG = "GSM_TASK";
+
+// CSV data string
+const char *csvData =
+  "Timestamp,Year,Month,Day,Hour,Minute,Second,AccelX,AccelY,AccelZ\n"
+  "1728238733,2024,9,6,18,18,53,-129,-47,1093\n"
+  "1728238735,2024,9,6,18,18,55,-130,-46,1100\n"
+  "1728238737,2024,9,6,18,18,57,-129,-45,1097\n"
+  "1728238739,2024,9,6,18,18,59,-129,-46,1100\n"
+  "1728238741,2024,9,6,18,19,1,-129,-42,1097\n"
+  "1728238733,2024,9,6,18,18,53,-139,-38,1095\n"
+  "1728238735,2024,9,6,18,18,55,-136,-42,1096\n"
+  "1728238737,2024,9,6,18,18,57,-136,-43,1095\n"
+  "1728238739,2024,9,6,18,18,59,-135,-41,1096\n"
+  "1728238741,2024,9,6,18,19,1,-136,-41,1095\n"
+  "1728238743,2024,9,6,18,19,3,-136,-43,1094\n"
+  "1728238745,2024,9,6,18,19,5,-136,-43,1097\n"
+  "1728238747,2024,9,6,18,19,7,-136,-44,1096\n"
+  "1728238749,2024,9,6,18,19,9,-136,-43,1094\n"
+  "1728238751,2024,9,6,18,19,11,-138,-44,1095\n"
+  "1728238753,2024,9,6,18,19,13,-136,-42,1096\n"
+  "1728238755,2024,9,6,18,19,15,-136,-42,1094\n"
+  "1728238757,2024,9,6,18,19,17,-135,-43,1097\n"
+  "1728238759,2024,9,6,18,19,19,-136,-43,1092\n"
+  "1728238761,2024,9,6,18,19,21,-137,-45,1094\n"
+  "1728238763,2024,9,6,18,19,23,-135,-43,1095\n"
+  "1728238765,2024,9,6,18,19,25,-138,-42,1093\n"
+  "1728238767,2024,9,6,18,19,27,-135,-43,1095\n"
+  "1728238769,2024,9,6,18,19,29,-137,-44,1098\n"
+  "1728238771,2024,9,6,18,19,31,-136,-43,1096\n"
+  "1728238773,2024,9,6,18,19,33,-137,-42,1095\n"
+  "1728238775,2024,9,6,18,19,35,-136,-43,1095\n"
+  "1728238777,2024,9,6,18,19,37,-137,-42,1094\n"
+  "1728238779,2024,9,6,18,19,39,-136,-44,1095\n"
+  "1728238781,2024,9,6,18,19,41,-138,-42,1094\n"
+  "1728238783,2024,9,6,18,19,43,-138,-43,1094\n"
+  "1728238785,2024,9,6,18,19,45,-137,-43,1094\n"
+  "1728238787,2024,9,6,18,19,47,-138,-44,1100\n"
+  "1728238789,2024,9,6,18,19,49,-135,-43,1095\n"
+  "1728238791,2024,9,6,18,19,51,-137,-43,1095\n"
+  "1728238793,2024,9,6,18,19,53,-137,-42,1093\n"
+  "1728238795,2024,9,6,18,19,55,-135,-42,1097\n";
+
+// UART initialization
+void uart_init(void) {
+    const uart_config_t uart_config = {
+        .baud_rate = 9600,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_driver_install(UART_NUM_1, RX_BUF_SIZE * 2, RX_BUF_SIZE * 2, 0, NULL, 0);
+    uart_param_config(UART_NUM_1, &uart_config);
+    uart_set_pin(UART_NUM_1, TX_PIN, RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+// GSM reset function
+void gsm_reset() {
+    gpio_set_level(RESET_PIN, 0);  // Pull the reset pin low
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    gpio_set_level(RESET_PIN, 1);  // Release the reset pin
+    ESP_LOGI(TAG, "GSM module reset");
+    vTaskDelay(10000 / portTICK_PERIOD_MS);
+}
+
+// Send data via UART
+int uart_send_data(const char *data) {
+    int len = strlen(data);
+    int txBytes = uart_write_bytes(UART_NUM_1, data, len);
+    ESP_LOGI(TAG, "Sent %d bytes: '%s'", txBytes, data);
+    return txBytes;
+}
+
+// Receive data via UART
+int uart_receive_data(char *buffer, int length) {
+    int rxBytes = uart_read_bytes(UART_NUM_1, (uint8_t *)buffer, length, 1000 / portTICK_PERIOD_MS);
+    if (rxBytes > 0) {
+        buffer[rxBytes] = 0;  // Null-terminate the received data
+        ESP_LOGI(TAG, "Received %d bytes: '%s'", rxBytes, buffer);
+    }
+    return rxBytes;
+}
+
+// Helper function to send AT command with retries
+bool send_at_command(const char *command, const char *expected_response, int retries, int delay_ms) {
+    for (int attempt = 0; attempt < retries; attempt++) {
+        uart_send_data(command);  // Send the command
+        vTaskDelay(delay_ms / portTICK_PERIOD_MS);  // Delay between command and response
+
+        // Receive and check the response
+        char response[128];
+        if (uart_receive_data(response, sizeof(response)) > 0 && strstr(response, expected_response)) {
+            ESP_LOGI(TAG, "AT command '%s' succeeded on attempt %d. Response: '%s'", command, attempt + 1, response);
+            return true;  // Command succeeded
+        }
+
+        ESP_LOGW(TAG, "AT command '%s' failed on attempt %d. Response: '%s'", command, attempt + 1, response);
+    }
+
+    ESP_LOGW(TAG, "");
+    return false;  // Command failed after all retries
+}
+
+// GSM communication logic
+void gsm_comm_task(void *arg)
+{
+    uart_init();  // Initialize UART
+    gpio_set_direction(RESET_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(RESET_PIN, 1);  // Ensure GSM module starts without reset
+
+    const int retries = 10;
+    const int delay_after_command = 6000;
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    // GSM Initialization
+    bool initialized = false;
+    for (int attempt = 0; attempt < retries; attempt++) {
+        if (send_at_command("AT+SAPBR=1,1\r\n", "OK", 1, delay_after_command)) {
+            ESP_LOGI(TAG, "GSM initialization successful");
+            initialized = true;
+            break;
+        }
+        ESP_LOGW(TAG, "GSM initialization attempt %d failed. Retrying...", attempt + 1);
+    }
+
+    if (!initialized) {
+        ESP_LOGE(TAG, "GSM initialization failed after %d retries. Exiting task.", retries);
+        return;
+    }
+
+    const int chunkSize = 300;
+    int totalLength = strlen(csvData);
+    int numChunks = totalLength / chunkSize + (totalLength % chunkSize != 0 ? 1 : 0);
+
+    for (int i = 0; i < numChunks; i++) {
+        char chunk[chunkSize + 1];
+        snprintf(chunk, sizeof(chunk), "%.*s", chunkSize, csvData + i * chunkSize);
+		/////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        int sequence_retry_count = 0;  // Counter for sequence retries
+        // AT Command Sequence
+        while (sequence_retry_count < 3) {
+            if (!send_at_command("AT+SAPBR=0,1\r\n", "OK", retries, 3000) ||
+                !send_at_command("AT+SAPBR=3,1,\"Contype\",\"GPRS\"\r\n", "OK", retries, delay_after_command) ||
+                !send_at_command("AT+SAPBR=3,1,\"APN\",\"safaricomiot\"\r\n", "OK", retries, delay_after_command) ||
+                !send_at_command("AT+SAPBR=1,1\r\n", "OK", retries, delay_after_command) ||
+                !send_at_command("AT+SAPBR=2,1\r\n", "OK", retries, delay_after_command) ||
+                !send_at_command("AT+HTTPINIT\r\n", "OK", retries, delay_after_command) ||
+                !send_at_command("AT+HTTPPARA=\"CID\",1\r\n", "OK", retries, delay_after_command) ||
+                !send_at_command("AT+HTTPPARA=\"URL\",\"b.geviton.co.ke/integrations/api/cbca82fe-4690-4daf-8fa0-7826312823df/\"\r\n", "OK", retries, delay_after_command) ||
+                !send_at_command("AT+HTTPPARA=\"CONTENT\",\"text/csv\"\r\n", "OK", retries, delay_after_command) ||
+                !send_at_command("AT+HTTPDATA=300,10000\r\n", "DOWNLOAD", retries, delay_after_command)) {
+                ESP_LOGW(TAG, "Error sending AT command sequence. Attempt %d/%d", sequence_retry_count + 1, 3);
+                sequence_retry_count++;
+            } else {
+                ESP_LOGI(TAG, "AT command sequence succeeded");
+                break;  // Exit retry loop if sequence succeeds
+            }
+        }
+        if (sequence_retry_count >= 3) {
+            ESP_LOGE(TAG, "Max retries for AT command sequence reached. Exiting...");
+            return;  // Exit if maximum retry limit is reached
+        }            
+		/////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        uart_send_data(chunk);
+        vTaskDelay(8000 / portTICK_PERIOD_MS);
+        ESP_LOGI(TAG, "Data chunk sent.");
+		////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        int sequence_retry2_count = 0;  // Counter for sequence retries
+        // AT Command Sequence
+        while (sequence_retry2_count < 3) {
+            if (!send_at_command("AT+HTTPACTION=1\r\n", "OK", retries, 4000) ||
+	            !send_at_command("AT+HTTPREAD\r\n", "OK", retries, 4000) ||
+	            !send_at_command("AT+HTTPTERM\r\n", "OK", retries, delay_after_command) ||
+	            !send_at_command("AT+CIPSHUT\r\n", "SHUT OK", retries, 1000) ||
+	            !send_at_command("AT+SAPBR=0,1\r\n", "OK", retries, 1000)) {
+                ESP_LOGW(TAG, "Error sending AT command sequence. Attempt %d/%d", sequence_retry2_count + 1, 3);
+                sequence_retry2_count++;
+            } else {
+                ESP_LOGI(TAG, "AT command sequence succeeded");
+                break;  // Exit retry loop if sequence succeeds
+            }
+        }
+        if (sequence_retry2_count >= 3) {
+            ESP_LOGE(TAG, "Max retries for AT command sequence reached. Exiting...");
+            return;  // Exit if maximum retry limit is reached
+        }    
+		//////////////////////////////////////////////////////////////////////////////////////////////////////////        
+        ESP_LOGI(TAG, "Chunk transmission completed successfully.");
+        gsm_reset();
+    }
+
+    ESP_LOGI(TAG, "GSM communication task completed successfully.");
+}
+
+// Main application entry point
+void app_main(void)
+{
+    xTaskCreate(gsm_comm_task, "gsm_comm_task", 4096, NULL, 5, NULL);
+}
